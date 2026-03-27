@@ -2,6 +2,7 @@
 
 # Default log file
 LOG_FILE="transfer_log.txt"
+SOURCE_DIR=""
 
 # Parse command line arguments
 while [[ "$#" -gt 0 ]]; do
@@ -16,8 +17,8 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 # Validate required arguments
-if [[ -z "$LIST_FILE" || -z "$SOURCE_DIR" || -z "$DEST_DIR" ]]; then
-    echo "Usage: ./nas_copier.sh -l <list_file> -s <source_dir> -d <dest_dir> [--log <log_file>]"
+if [[ -z "$LIST_FILE" || -z "$DEST_DIR" ]]; then
+    echo "Usage: ./nas_copier.sh -l <list_file.txt|.csv> -d <dest_dir> [-s <source_dir>] [--log <log_file>]"
     exit 1
 fi
 
@@ -38,19 +39,43 @@ get_size() {
 }
 
 echo "\nLoaded paths from $LIST_FILE"
-echo "Scanning source drive: $SOURCE_DIR\n"
-echo "--- Starting NAS Copy Job ---" >> "$LOG_FILE"
+if [[ -n "$SOURCE_DIR" ]]; then
+    echo "Using base source directory: $SOURCE_DIR"
+else
+    echo "No source directory provided. Treating paths in list as absolute."
+fi
+echo "\n--- Starting NAS Copy Job ---" >> "$LOG_FILE"
+
+# Initialize counters for the summary
+count_copied=0
+count_skipped=0
+count_failed=0
+count_not_found=0
 
 # Read the file line by line
-while IFS= read -r path_str || [[ -n "$path_str" ]]; do
+while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+    # 1. Strip hidden carriage returns (common in Windows-generated CSVs)
+    path_str="${raw_line%$'\r'}"
+    
+    # 2. Strip surrounding double quotes (common in CSVs if paths have spaces)
+    if [[ "$path_str" == \"*\" ]]; then
+        path_str="${path_str:1:-1}"
+    fi
+
     # Skip empty lines
     [[ -z "${path_str// /}" ]] && continue
 
-    # Strip leading slashes to make it a clean relative path
-    clean_path="${path_str#/}"
+    # Strip leading slashes to make a clean relative path for the DESTINATION structure
+    clean_path="${path_str}"
     while [[ "$clean_path" == /* ]]; do clean_path="${clean_path#/}"; done
 
-    src_file="$SOURCE_DIR/$clean_path"
+    # Determine the source file based on whether -s was provided
+    if [[ -n "$SOURCE_DIR" ]]; then
+        src_file="$SOURCE_DIR/$clean_path"
+    else
+        src_file="$path_str"
+    fi
+    
     dest_file="$DEST_DIR/$clean_path"
     dest_parent="${dest_file%/*}"
 
@@ -61,8 +86,9 @@ while IFS= read -r path_str || [[ -n "$path_str" ]]; do
             dest_size=$(get_size "$dest_file")
             
             if [[ "$src_size" == "$dest_size" ]]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') - INFO - SKIPPED (Already on NAS): $path_str" >> "$LOG_FILE"
-                echo "⏭️  Skipped: $path_str (Already exists)"
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - INFO - SKIPPED (Already on NAS): $src_file" >> "$LOG_FILE"
+                echo "⏭️  Skipped: $src_file (Already exists)"
+                ((count_skipped++))
                 continue
             fi
         fi
@@ -70,21 +96,32 @@ while IFS= read -r path_str || [[ -n "$path_str" ]]; do
         # Create destination directory structure
         mkdir -p "$dest_parent"
 
-        # Copy using rsync: 
-        # -a (archive, preserves metadata)
-        # --info=progress2 (shows overall progress/speed similar to tqdm)
+        # Copy using rsync
         if rsync -a --info=progress2 "$src_file" "$dest_file"; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - INFO - COPIED: $path_str" >> "$LOG_FILE"
-            echo "✅ Success: $path_str"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - INFO - COPIED: $src_file" >> "$LOG_FILE"
+            echo "✅ Success: $src_file"
+            ((count_copied++))
         else
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - ERROR - FAILED TO COPY: $path_str" >> "$LOG_FILE"
-            echo "❌ Failed:  $path_str (See log for details)"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - ERROR - FAILED TO COPY: $src_file" >> "$LOG_FILE"
+            echo "❌ Failed:  $src_file (See log for details)"
+            ((count_failed++))
         fi
     else
-        echo "$(date '+%Y-%m-%d %H:%M:%S') - DEBUG - NOT FOUND on this drive: $path_str" >> "$LOG_FILE"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - DEBUG - NOT FOUND: $src_file" >> "$LOG_FILE"
+        ((count_not_found++))
     fi
 
 done < "$LIST_FILE"
 
+# Log and print the final summary
 echo "--- Job Complete ---" >> "$LOG_FILE"
-echo "\n🎉 All done! Check $LOG_FILE for a full record."
+echo "Summary: $count_copied copied, $count_skipped skipped, $count_failed failed, $count_not_found not found on this drive." >> "$LOG_FILE"
+
+echo "\n🎉 All done! Here is your summary:"
+echo "-----------------------------------"
+echo "✅ Copied:    $count_copied"
+echo "⏭️  Skipped:   $count_skipped"
+echo "❌ Failed:    $count_failed"
+echo "🔍 Not Found: $count_not_found (Check next drive)"
+echo "-----------------------------------"
+echo "Check $LOG_FILE for a full record."
